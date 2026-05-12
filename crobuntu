@@ -302,8 +302,16 @@ exit 0
 EOF
     chmod 0755 "$ROOTFS_MNT/etc/rc.local"
 
-    DESKTOP_PACKAGE="$DESKTOP_PACKAGE" chroot "$ROOTFS_MNT" /bin/bash -eux <<'EOF'
+    DESKTOP_PACKAGE="$DESKTOP_PACKAGE" device_name="$device_name" chroot "$ROOTFS_MNT" /bin/bash -eux <<'EOF'
 export DEBIAN_FRONTEND=noninteractive
+
+printf '%s\n' "$device_name" > /etc/hostname
+touch /etc/hosts
+if ! grep -q '^127\.0\.0\.1[[:space:]]' /etc/hosts; then
+    printf '127.0.0.1\tlocalhost\n' >> /etc/hosts
+fi
+sed -i '/^127\.0\.1\.1[[:space:]]/d' /etc/hosts
+printf '127.0.1.1\t%s\n' "$device_name" >> /etc/hosts
 
 apt-get update
 apt-get install -y \
@@ -353,8 +361,11 @@ need_cmd mountpoint
 need_cmd tar
 need_cmd chroot
 need_cmd blkid
+need_cmd cros_config
 
 cd /tmp
+device_name="$(cros_config / name)"
+[[ -n "$device_name" ]] || die "cros_config returned an empty device name"
 
 select_tar_url
 select_desktop_package
@@ -384,6 +395,7 @@ if (( STAGING_OFFSET_BYTES % SECTOR_SIZE != 0 )); then
 fi
 
 echo "Internal disk: $DISK"
+echo "Device name:   $device_name"
 echo "TarBall URL:     $TAR_URL"
 echo "Desktop pkg: ${DESKTOP_PACKAGE:-<none>}"
 echo "Disk size:   $DISK_BYTES bytes"

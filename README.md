@@ -23,6 +23,9 @@ Note:
 2. Web browser might not be installed because snap pacakegs could not be installed automatically during the `chroot` setup process. You can just simply do `snap install firefox` to get Firefox installed.
 3. Some desktop environment packages may not be able to setup correctly due to `chroot` env. If you encounter errors during the package installation, try another desktop selection. I tested `ubuntu-desktop` `ubuntu-desktop-minimal` and `kubuntu-desktop` are working perfectly. If the desktop you like can not setup by the script, you can install it after rebooted into Ubuntu.
 
+## No Sound on Ubuntu?
+Check https://github.com/WeirdTreeThing/chromebook-linux-audio
+
 ## What the script does (Techical details)
 It downloads `submarine-x86_64.zip` from this repository (I got it from https://nightly.link/FyraLabs/submarine/workflows/build/main/submarine-x86_64.zip, which is the offical release place of submarine), unzip it, and use `dd` to write `submarine.bin` to internal disk.
 

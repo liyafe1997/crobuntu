@@ -1,6 +1,6 @@
 One script, in-place Ubuntu installer (replace ChromeOS) on Chromebook. 
 
-**Only x86 devices supported at this moment.**
+**Only x86 devices are supported at this moment.**
 
 No USB drive, no RW_LEGACY, no WP unlocking needed!
 

@@ -1,0 +1,543 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# In-place replace ChromeOS with Ubuntu.
+# Must be run on ChromeOS VT2 (Ctrl+Alt+Refresh/Forward), not from crosh.
+
+SUBMARINE_ZIP_URL="https://github.com/liyafe1997/crobuntu/raw/main/submarine-x86_64.zip"
+WORKDIR="/tmp/submarine-install.$$"
+ROOTFS_MNT="/tmp/rootfs"
+STAGING_SIZE_MIB=10000
+MIN_NON_OVERLAP_DISK_MIB=25000
+
+EFI_SIZE_MIB=500
+MIN_EXTRA_MIB=1024
+ALIGN_SECTORS=2048
+
+LOOP_P2=""
+LOOP_P3=""
+LOOP_STAGE=""
+ROOTFS_UUID=""
+EFI_UUID=""
+STAGING_SIZE_BYTES=""
+STAGING_OFFSET_BYTES=""
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+align_up() {
+    local value="$1"
+    local align="$2"
+    echo $(( ((value + align - 1) / align) * align ))
+}
+
+align_down() {
+    local value="$1"
+    local align="$2"
+    echo $(( (value / align) * align ))
+}
+
+find_target_disk() {
+    local kernel_part
+    local disk
+
+    kernel_part="$(
+        fdisk -l 2>/dev/null |
+        awk '/kernel/ { print $1; exit }'
+    )"
+
+    [[ -n "$kernel_part" ]] || die "could not find kernel partition from fdisk -l"
+
+    disk="$(sed -E 's/p?[0-9]+$//' <<<"$kernel_part")"
+    [[ -b "$disk" ]] || die "resolved target disk is not a block device: $disk"
+
+    echo "$disk"
+}
+
+select_tar_url() {
+    local choice
+    local -a tar_urls=(
+        "https://cdimage.ubuntu.com/ubuntu-base/releases/26.04/release/ubuntu-base-26.04-base-amd64.tar.gz"
+        "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04.4/release/ubuntu-base-24.04.3-base-amd64.tar.gz"
+    )
+
+    echo "Select rootfs tarball (Ubuntu version):"
+    PS3="Enter choice [1-$(( ${#tar_urls[@]} + 1 ))]: "
+    select choice in "${tar_urls[@]}" "Custom"
+    do
+        case "$choice" in
+            "Custom")
+                read -r -p "Enter custom TAR URL: " TAR_URL
+                [[ -n "$TAR_URL" ]] || die "custom TAR URL cannot be empty"
+                return 0
+                ;;
+            "")
+                ;;
+            *)
+                TAR_URL="$choice"
+                return 0
+                ;;
+        esac
+        echo "Invalid choice, please try again."
+    done
+}
+
+select_desktop_package() {
+    local choice
+    local -a desktop_packages=(
+        "ubuntu-desktop-minimal"
+        "ubuntu-desktop"
+        "xubuntu-desktop-minimal"
+        "xubuntu-desktop"
+        "lubuntu-desktop"
+        "kubuntu-desktop"
+        "ubuntucinnamon-desktop-minimal"
+        "ubuntucinnamon-desktop"
+        "ubuntu-budgie-desktop-minimal"
+        "ubuntu-budgie-desktop"
+    )
+
+    echo "Select desktop package:"
+    PS3="Enter choice [1-$(( ${#desktop_packages[@]} + 2 ))]: "
+    select choice in "${desktop_packages[@]}" "None" "Custom"
+    do
+        case "$choice" in
+            "None")
+                DESKTOP_PACKAGE=""
+                return 0
+                ;;
+            "Custom")
+                read -r -p "Enter custom desktop package (leave empty for none): " DESKTOP_PACKAGE
+                return 0
+                ;;
+            "")
+                ;;
+            *)
+                DESKTOP_PACKAGE="$choice"
+                return 0
+                ;;
+        esac
+        echo "Invalid choice, please try again."
+    done
+}
+
+is_crosh_shell() {
+    if [ -n "${CROS_USER_ID_HASH:-}" ]; then
+        return 0
+    fi
+
+    local pid ppid comm cmdline
+
+    pid="$$"
+    while [ "$pid" != "1" ] && [ -r "/proc/$pid/stat" ]; do
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+        cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+
+        case "$comm $cmdline" in
+            *crosh*|*crosh.sh*|*crosh_builtin*|*secure_shell*)
+                return 0
+                ;;
+        esac
+
+        ppid="$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || true)"
+        [ -n "$ppid" ] || break
+        pid="$ppid"
+    done
+
+    return 1
+}
+
+reject_crosh_shell() {
+    if is_crosh_shell; then
+        die "Please do not run this script from crosh. Run this script from ChromeOS VT2, not from crosh: press Ctrl+Alt+F2(Refresh/Forward), login as root, then run this script."
+    fi
+}
+
+stop_chromeos_ui() {
+    echo "Stopping ChromeOS UI/session_manager..."
+    if command -v stop >/dev/null 2>&1; then
+        stop ui 2>/dev/null || true
+    elif command -v initctl >/dev/null 2>&1; then
+        initctl stop ui 2>/dev/null || true
+    else
+        echo "WARNING: neither stop nor initctl found; cannot stop ChromeOS UI."
+        return 0
+    fi
+    initctl stop system-services 2>/dev/null || true
+    sleep 1
+
+    if command -v status >/dev/null 2>&1; then
+        status ui 2>/dev/null || true
+    elif command -v initctl >/dev/null 2>&1; then
+        initctl status ui 2>/dev/null || true
+    fi
+}
+
+write_fstab() {
+    cat > "$ROOTFS_MNT/etc/fstab" <<EOF
+UUID=$ROOTFS_UUID / ext4 defaults 0 1
+UUID=$EFI_UUID /boot/efi vfat umask=0077 0 1
+EOF
+}
+
+prepare_staging_rootfs() {
+    rm -rf "$ROOTFS_MNT"
+    mkdir -p "$ROOTFS_MNT"
+
+    echo "Mapping tail ${STAGING_SIZE_MIB}MiB of $DISK as staging loop..."
+    LOOP_STAGE="$(
+        losetup --find --show \
+            --offset "$STAGING_OFFSET_BYTES" \
+            --sizelimit "$STAGING_SIZE_BYTES" \
+            "$DISK"
+    )"
+
+    echo "Formatting staging loop as ext4 via $LOOP_STAGE..."
+    mkfs.ext4 -F -L staging-rootfs "$LOOP_STAGE"
+
+    echo "Mounting staging ext4 on $ROOTFS_MNT..."
+    mount "$LOOP_STAGE" "$ROOTFS_MNT"
+}
+
+prepare_chroot_mounts() {
+    mkdir -p \
+        "$ROOTFS_MNT/dev" \
+        "$ROOTFS_MNT/dev/pts" \
+        "$ROOTFS_MNT/proc" \
+        "$ROOTFS_MNT/sys" \
+        "$ROOTFS_MNT/run" \
+        "$ROOTFS_MNT/etc" \
+        "$ROOTFS_MNT/boot/efi"
+
+    mount --bind /dev "$ROOTFS_MNT/dev"
+    mount --bind /dev/pts "$ROOTFS_MNT/dev/pts"
+    mount --bind /proc "$ROOTFS_MNT/proc"
+    mount --bind /sys "$ROOTFS_MNT/sys"
+    mount --bind /run "$ROOTFS_MNT/run"
+
+    rm -f "$ROOTFS_MNT/etc/resolv.conf"
+    touch "$ROOTFS_MNT/etc/resolv.conf"
+    mount --bind /etc/resolv.conf "$ROOTFS_MNT/etc/resolv.conf"
+
+    mount "$LOOP_P2" "$ROOTFS_MNT/boot/efi"
+}
+
+cleanup_chroot_mounts() {
+    local mount_path
+
+    for mount_path in \
+        "$ROOTFS_MNT/boot/efi" \
+        "$ROOTFS_MNT/etc/resolv.conf" \
+        "$ROOTFS_MNT/run" \
+        "$ROOTFS_MNT/sys" \
+        "$ROOTFS_MNT/proc" \
+        "$ROOTFS_MNT/dev/pts" \
+        "$ROOTFS_MNT/dev"
+    do
+        if mountpoint -q "$mount_path"; then
+            umount "$mount_path"
+        fi
+    done
+}
+
+copy_rootfs_to_target() {
+    local staging_bytes
+
+    staging_bytes="$(blockdev --getsize64 "$LOOP_STAGE")"
+    [[ -n "$staging_bytes" ]] || die "failed to get staging image size"
+    [[ "$staging_bytes" =~ ^[0-9]+$ ]] || die "invalid staging image size: $staging_bytes"
+
+    if (( staging_bytes > P3_SIZE_BYTES )); then
+        die "staging image is larger than p3 rootfs partition"
+    fi
+
+    sync
+    if mountpoint -q "$ROOTFS_MNT"; then
+        umount "$ROOTFS_MNT"
+    fi
+    echo "-----------------------------------------------------------------------"
+    echo "Default username: ubuntu, password: ubuntu"
+    echo "Snap packages are not installed by default so web browser may not be installed."
+    echo "You can do [snap install firefox] after first login."
+    echo
+    echo "Writing staging ext4 loop into p3 via $LOOP_P3..."
+    echo "After below progress completed, press [Refresh + Power] to reboot to Ubuntu immediately!"
+    echo "-----------------------------------------------------------------------"
+    dd if="$LOOP_STAGE" of="$LOOP_P3" bs=128M status=progress conv=fsync
+}
+
+configure_rootfs() {
+    mkdir -p "$ROOTFS_MNT/etc/apt"
+
+    write_fstab
+
+    cat > "$ROOTFS_MNT/usr/bin/firstboot-expand-rootfs" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+root_source="$(findmnt -n -o SOURCE /)"
+[[ -n "$root_source" ]] || exit 1
+
+resize2fs "$root_source"
+apt clean
+apt autoclean
+fstrim -av
+sed -i '\|/usr/bin/firstboot-expand-rootfs|d' /etc/rc.local
+rm -f /usr/bin/firstboot-expand-rootfs
+EOF
+    chmod 0755 "$ROOTFS_MNT/usr/bin/firstboot-expand-rootfs"
+
+    cat > "$ROOTFS_MNT/etc/rc.local" <<'EOF'
+#!/bin/bash
+set -e
+
+/usr/bin/firstboot-expand-rootfs || true
+exit 0
+EOF
+    chmod 0755 "$ROOTFS_MNT/etc/rc.local"
+
+    DESKTOP_PACKAGE="$DESKTOP_PACKAGE" chroot "$ROOTFS_MNT" /bin/bash -eux <<'EOF'
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y \
+    linux-image-generic \
+    grub-efi-amd64 \
+    shim-signed \
+    sudo \
+    network-manager \
+    e2fsprogs \
+    bash-completion \
+    command-not-found \
+    systemd-sysv ${DESKTOP_PACKAGE:-}
+
+if ! id -u ubuntu >/dev/null 2>&1; then
+    useradd -m -s /bin/bash -G sudo ubuntu
+fi
+echo 'ubuntu:ubuntu' | chpasswd
+
+sed -i '/^GRUB_DISABLE_OS_PROBER=/d' /etc/default/grub
+echo 'GRUB_DISABLE_OS_PROBER=true' >> /etc/default/grub
+
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck
+update-grub
+EOF
+}
+
+
+reject_crosh_shell
+
+[[ "$(id -u)" == "0" ]] || die "run as root"
+
+need_cmd curl
+need_cmd bsdunzip
+need_cmd dd
+need_cmd cgpt
+need_cmd blockdev
+need_cmd fdisk
+need_cmd awk
+need_cmd sed
+need_cmd grep
+need_cmd losetup
+need_cmd mkfs.vfat
+need_cmd mkfs.ext4
+need_cmd mount
+need_cmd umount
+need_cmd mountpoint
+need_cmd tar
+need_cmd chroot
+need_cmd blkid
+
+cd /tmp
+
+select_tar_url
+select_desktop_package
+DISK="$(find_target_disk)"
+[[ -b "$DISK" ]] || die "target disk is not a block device: $DISK"
+
+DISK_BASE="$(basename "$DISK")"
+REMOVABLE_FILE="/sys/class/block/${DISK_BASE}/removable"
+if [[ -f "$REMOVABLE_FILE" ]]; then
+    REMOVABLE="$(cat "$REMOVABLE_FILE")"
+    [[ "$REMOVABLE" == "0" ]] || die "target disk appears removable: $DISK"
+fi
+
+DISK_BYTES="$(blockdev --getsize64 "$DISK")"
+SECTOR_SIZE="$(blockdev --getss "$DISK")"
+TOTAL_SECTORS="$(blockdev --getsz "$DISK")"
+STAGING_SIZE_BYTES=$(( STAGING_SIZE_MIB * 1024 * 1024 ))
+STAGING_OFFSET_BYTES=$(( DISK_BYTES - STAGING_SIZE_BYTES ))
+MIN_NON_OVERLAP_DISK_BYTES=$(( MIN_NON_OVERLAP_DISK_MIB * 1024 * 1024 ))
+
+if (( DISK_BYTES <= MIN_NON_OVERLAP_DISK_BYTES )); then
+    die "target disk must be larger than ${MIN_NON_OVERLAP_DISK_MIB}MiB so the tail ${STAGING_SIZE_MIB}MiB staging loop cannot overlap the p3 write range"
+fi
+
+if (( STAGING_OFFSET_BYTES % SECTOR_SIZE != 0 )); then
+    die "staging loop offset is not sector aligned"
+fi
+
+echo "Internal disk: $DISK"
+echo "TarBall URL:     $TAR_URL"
+echo "Desktop pkg: ${DESKTOP_PACKAGE:-<none>}"
+echo "Disk size:   $DISK_BYTES bytes"
+echo "Sector size: $SECTOR_SIZE bytes"
+echo "Sectors:     $TOTAL_SECTORS"
+echo "Staging loop: offset=$STAGING_OFFSET_BYTES size=$STAGING_SIZE_BYTES"
+
+echo
+echo "WARNING: ALL DATA WILL BE ERASED ON THIS DISK!"
+read -r -p "CONTINUE? [y/N] " CONFIRM
+
+case "$CONFIRM" in
+    [Yy]|[Yy][Ee][Ss])
+        echo "Continuing..."
+        ;;
+    ""|[Nn]|[Nn][Oo])
+        die "Aborted by user."
+        ;;
+    *)
+        die "Invalid answer: $CONFIRM"
+        ;;
+esac
+echo
+
+echo
+echo "DANGER: this will overwrite $DISK completely."
+echo "Sleeping 5 seconds. Now you still have chance to cancel. Press Ctrl+C to abort."
+sleep 5
+
+rm -rf "$WORKDIR"
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+
+echo "Downloading Submarine..."
+curl -fL --progress-bar "$SUBMARINE_ZIP_URL" -o submarine-x86_64.zip
+
+echo "Unzipping Submarine..."
+bsdunzip -q submarine-x86_64.zip
+
+[[ -f submarine-x86.bin ]] || die "submarine-x86.bin not found in zip root"
+
+stop_chromeos_ui
+
+echo "Writing submarine-x86.bin to $DISK..."
+dd if=submarine-x86.bin of="$DISK" bs=4M status=progress conv=fsync
+
+sync
+
+echo "Repairing GPT to target disk size..."
+cgpt repair "$DISK"
+
+echo "Reading p1 layout from GPT..."
+P1_START="$(cgpt show "$DISK" | awk '$3 == "1" {print $1; exit}')"
+P1_SIZE="$(cgpt show "$DISK" | awk '$3 == "1" {print $2; exit}')"
+
+[[ -n "$P1_START" && -n "$P1_SIZE" ]] || die "could not parse p1 from cgpt show"
+[[ "$P1_START" =~ ^[0-9]+$ ]] || die "invalid P1_START: $P1_START"
+[[ "$P1_SIZE" =~ ^[0-9]+$ ]] || die "invalid P1_SIZE: $P1_SIZE"
+
+P1_END=$(( P1_START + P1_SIZE ))
+
+EFI_SIZE_SECTORS=$(( EFI_SIZE_MIB * 1024 * 1024 / SECTOR_SIZE ))
+
+P2_START="$(align_up "$P1_END" "$ALIGN_SECTORS")"
+P2_SIZE="$(align_up "$EFI_SIZE_SECTORS" "$ALIGN_SECTORS")"
+P2_END=$(( P2_START + P2_SIZE ))
+
+P3_START="$(align_up "$P2_END" "$ALIGN_SECTORS")"
+P3_END="$(align_down "$(( TOTAL_SECTORS - ALIGN_SECTORS ))" "$ALIGN_SECTORS")"
+P3_SIZE=$(( P3_END - P3_START ))
+
+if (( P3_SIZE <= 0 )); then
+    die "not enough room for p2=${EFI_SIZE_MIB}MiB and p3=rootfs"
+fi
+
+P2_OFFSET_BYTES=$(( P2_START * SECTOR_SIZE ))
+P2_SIZE_BYTES=$(( P2_SIZE * SECTOR_SIZE ))
+
+P3_OFFSET_BYTES=$(( P3_START * SECTOR_SIZE ))
+P3_SIZE_BYTES=$(( P3_SIZE * SECTOR_SIZE ))
+P3_WRITE_END_BYTES=$(( P3_OFFSET_BYTES + STAGING_SIZE_BYTES ))
+
+if (( STAGING_SIZE_BYTES > P3_SIZE_BYTES )); then
+    die "tail staging loop is larger than p3 rootfs partition"
+fi
+
+if (( P3_WRITE_END_BYTES > STAGING_OFFSET_BYTES )); then
+    die "tail staging loop would overlap the p3 destination write range"
+fi
+
+echo "Partition plan:"
+echo "  p1 Submarine: start=$P1_START size=$P1_SIZE"
+echo "  p2 EFI:       start=$P2_START size=$P2_SIZE"
+echo "  p3 rootfs:    start=$P3_START size=$P3_SIZE"
+
+echo "Byte ranges:"
+echo "  p2 EFI:       offset=$P2_OFFSET_BYTES size=$P2_SIZE_BYTES"
+echo "  p3 rootfs:    offset=$P3_OFFSET_BYTES size=$P3_SIZE_BYTES"
+echo "  p3 write:     offset=$P3_OFFSET_BYTES size=$STAGING_SIZE_BYTES"
+echo "  staging loop: offset=$STAGING_OFFSET_BYTES size=$STAGING_SIZE_BYTES"
+
+echo "Creating p2 EFI partition in GPT..."
+cgpt add -i 2 -b "$P2_START" -s "$P2_SIZE" -t efi -l "EFI-SYSTEM" "$DISK"
+
+echo "Creating p3 rootfs partition in GPT..."
+cgpt add -i 3 -b "$P3_START" -s "$P3_SIZE" -t data -l "ROOTFS" "$DISK"
+
+sync
+
+echo "Re-reading partition table if possible..."
+blockdev --rereadpt "$DISK" 2>/dev/null || true
+partprobe "$DISK" 2>/dev/null || true
+udevadm settle 2>/dev/null || true
+sleep 1
+
+echo "Mapping p2 EFI byte range as loop device..."
+LOOP_P2="$(
+    losetup --find --show \
+        --offset "$P2_OFFSET_BYTES" \
+        --sizelimit "$P2_SIZE_BYTES" \
+        "$DISK"
+)"
+
+echo "Formatting p2 EFI range as FAT32 via $LOOP_P2..."
+mkfs.vfat -F 32 -n EFI "$LOOP_P2"
+
+echo "Keeping EFI loop device $LOOP_P2 for later chroot use..."
+
+echo "Mapping p3 rootfs byte range as loop device..."
+LOOP_P3="$(
+    losetup --find --show \
+        --offset "$P3_OFFSET_BYTES" \
+        --sizelimit "$P3_SIZE_BYTES" \
+        "$DISK"
+)"
+
+prepare_staging_rootfs
+mkdir -p "$ROOTFS_MNT/boot/efi"
+
+echo "Streaming TAR $TAR_URL"
+echo "  and extracting it into $ROOTFS_MNT..."
+curl -fL --progress-bar "$TAR_URL" |
+    tar -xzp --numeric-owner -C "$ROOTFS_MNT"
+
+ROOTFS_UUID="$(blkid -s UUID -o value "$LOOP_STAGE")"
+EFI_UUID="$(blkid -s UUID -o value "$LOOP_P2")"
+
+[[ -n "$ROOTFS_UUID" ]] || die "failed to get rootfs UUID"
+[[ -n "$EFI_UUID" ]] || die "failed to get EFI UUID"
+
+prepare_chroot_mounts
+configure_rootfs
+cleanup_chroot_mounts
+
+initctl stop boot-services 2>/dev/null || true
+
+copy_rootfs_to_target

@@ -17,6 +17,7 @@ All you need is:
     ````
 5. Follow the script prompt to continue (Basically select Ubuntu version and desktop environment)
 6. Wait it to be finished. After reboot, you will have Ubuntu!
+7. If you want to go back to ChromeOS, see [Recover your Chromebook](https://support.google.com/chromebook/answer/1080595)
 
 Note:
 1. Default username: `ubuntu`, password: `ubuntu`.

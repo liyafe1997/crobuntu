@@ -1,5 +1,5 @@
 ## Introduction
-One script, in-place Ubuntu installer (replace ChromeOS) on Chromebook. 
+One script, in-place Ubuntu installer (replace ChromeOS) for Chromebook. 
 
 **Only x86 devices are supported at this moment.**
 

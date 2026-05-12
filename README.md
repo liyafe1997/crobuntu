@@ -7,7 +7,7 @@ No USB drive, no RW_LEGACY, no WP unlocking needed!
 All you need is:
 1. [Turn on Developer mode on your Chromebook.](https://www.chromium.org/chromium-os/developer-library/guides/device/developer-mode/)
 2. Once ChromeOS started in developer mode, just connect to Wi-Fi. **No need** to login with Google Account!
-3. Press [Ctrl+Alt+F2(Refresh/Forward)] enter VT2 console, login with `root` (should be no password).
+3. Press [Ctrl+Alt+F2`(Refresh/Forward)`] enter VT2 console, login with `root` (should be no password).
 4. Enter following commands:
     ````bash
     cd /tmp
@@ -15,7 +15,7 @@ All you need is:
     bash crobuntu
     ````
 5. Follow the script prompt to continue (Basically select Ubuntu version and desktop environment)
-6. Wait it to be finished. After reboot, After reboot, you will have Ubuntu!
+6. Wait it to be finished. After reboot, you will have Ubuntu!
 
 Note: default username: `ubuntu`, password: `ubuntu`.
 

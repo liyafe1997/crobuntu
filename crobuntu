@@ -305,7 +305,7 @@ EOF
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-apt-get install -y \
+apt-get install --no-install-recommends -y \
     linux-image-generic \
     grub-efi-amd64 \
     shim-signed \

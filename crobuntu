@@ -281,7 +281,7 @@ set -euo pipefail
 root_source="$(findmnt -n -o SOURCE /)"
 [[ -n "$root_source" ]] || exit 1
 
-rm -f "$ROOTFS_MNT/etc/resolv.conf"
+rm -f /etc/resolv.conf
 
 resize2fs "$root_source"
 apt clean

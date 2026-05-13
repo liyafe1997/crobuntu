@@ -305,9 +305,11 @@ EOF
     DESKTOP_PACKAGE="$DESKTOP_PACKAGE" device_name="$device_name" chroot "$ROOTFS_MNT" /bin/bash -eux <<'EOF'
 export DEBIAN_FRONTEND=noninteractive
 
+source /etc/os-release
+
 apt-get update
-apt-get install --no-install-recommends -y \
-    linux-image-generic \
+apt-get install -y \
+    "linux-generic-hwe-${VERSION_ID}" \
     grub-efi-amd64 \
     shim-signed \
     sudo \

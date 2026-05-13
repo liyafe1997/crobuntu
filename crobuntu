@@ -170,6 +170,7 @@ stop_chromeos_ui() {
         return 0
     fi
     initctl stop system-services 2>/dev/null || true
+    initctl stop powerd 2>/dev/null || true
     sleep 1
 
     echo 1 | tee /proc/sys/kernel/sysrq

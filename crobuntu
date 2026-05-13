@@ -172,11 +172,8 @@ stop_chromeos_ui() {
     initctl stop system-services 2>/dev/null || true
     sleep 1
 
-    if command -v status >/dev/null 2>&1; then
-        status ui 2>/dev/null || true
-    elif command -v initctl >/dev/null 2>&1; then
-        initctl status ui 2>/dev/null || true
-    fi
+    echo 1 | tee /proc/sys/kernel/sysrq
+    echo u | tee /proc/sysrq-trigger   # remount readonly
 }
 
 write_fstab() {
@@ -507,12 +504,6 @@ echo "Creating p3 rootfs partition in GPT..."
 cgpt add -i 3 -b "$P3_START" -s "$P3_SIZE" -t data -l "ROOTFS" "$DISK"
 
 sync
-
-echo "Re-reading partition table if possible..."
-blockdev --rereadpt "$DISK" 2>/dev/null || true
-partprobe "$DISK" 2>/dev/null || true
-udevadm settle 2>/dev/null || true
-sleep 1
 
 echo "Mapping p2 EFI byte range as loop device..."
 LOOP_P2="$(

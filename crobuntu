@@ -8,7 +8,6 @@ SUBMARINE_ZIP_URL="https://github.com/liyafe1997/crobuntu/raw/main/submarine-x86
 WORKDIR="/tmp/submarine-install.$$"
 ROOTFS_MNT="/tmp/rootfs"
 STAGING_SIZE_MIB=10000
-MIN_NON_OVERLAP_DISK_MIB=25000
 
 EFI_SIZE_MIB=500
 MIN_EXTRA_MIB=1024
@@ -21,6 +20,10 @@ ROOTFS_UUID=""
 EFI_UUID=""
 STAGING_SIZE_BYTES=""
 STAGING_OFFSET_BYTES=""
+
+MINIOS_START=""
+MINIOS_SIZE=""
+MINIOS_TYPE_UUID=""
 
 die() {
     echo "ERROR: $*" >&2
@@ -58,6 +61,42 @@ find_target_disk() {
     [[ -b "$disk" ]] || die "resolved target disk is not a block device: $disk"
 
     echo "$disk"
+}
+
+detect_minios_partition() {
+    local line
+
+    line="$(fdisk -x "$DISK" 2>/dev/null | grep 'MINIOS-B' || true)"
+    if [[ -z "$line" ]]; then
+        echo
+        echo "WARNING: MINIOS-B partition not found."
+        echo "This means ChromeOS Cloud Recovery may not be available for your machine."
+        echo "If you continue, the entire disk will be replaced by Ubuntu and you will"
+        echo "need a USB drive to recover ChromeOS."
+        echo
+        read -r -p "Continue? [y/N] " ans
+        case "$ans" in
+            [Yy]|[Yy][Ee][Ss]) ;;
+            *) die "Aborted by user." ;;
+        esac
+        return 0
+    fi
+
+    MINIOS_START="$(awk '{print $2}' <<<"$line")"
+    local minios_end
+    minios_end="$(awk '{print $3}' <<<"$line")"
+    MINIOS_SIZE=$(( minios_end - MINIOS_START + 1 ))
+    MINIOS_TYPE_UUID="$(awk '{print $6}' <<<"$line")"
+
+    [[ -n "$MINIOS_START" && "$MINIOS_START" =~ ^[0-9]+$ ]] || die "could not parse MINIOS-B start sector"
+    [[ -n "$minios_end" && "$minios_end" =~ ^[0-9]+$ ]] || die "could not parse MINIOS-B end sector"
+    [[ -n "$MINIOS_TYPE_UUID" ]] || die "could not parse MINIOS-B type UUID"
+    echo 
+    echo "Found MINIOS-B (ChromeOS Cloud Recovery) partition. Nice!"
+    echo "We will keep this recovery partition for you."
+    echo "So that you can go back to ChromeOS by using ChromeOS Cloud Recovery, without making a USB drive."
+    echo "Tips: Press [ESC+Refresh+Power] and select [Recover using internet] to recover ChromeOS."
+    echo
 }
 
 select_tar_url() {
@@ -188,7 +227,7 @@ prepare_staging_rootfs() {
     rm -rf "$ROOTFS_MNT"
     mkdir -p "$ROOTFS_MNT"
 
-    echo "Mapping tail ${STAGING_SIZE_MIB}MiB of $DISK as staging loop..."
+    echo "Mapping tail ${STAGING_SIZE_MIB}MiB of p3 as staging loop..."
     LOOP_STAGE="$(
         losetup --find --show \
             --offset "$STAGING_OFFSET_BYTES" \
@@ -386,16 +425,14 @@ DISK_BYTES="$(blockdev --getsize64 "$DISK")"
 SECTOR_SIZE="$(blockdev --getss "$DISK")"
 TOTAL_SECTORS="$(blockdev --getsz "$DISK")"
 STAGING_SIZE_BYTES=$(( STAGING_SIZE_MIB * 1024 * 1024 ))
-STAGING_OFFSET_BYTES=$(( DISK_BYTES - STAGING_SIZE_BYTES ))
-MIN_NON_OVERLAP_DISK_BYTES=$(( MIN_NON_OVERLAP_DISK_MIB * 1024 * 1024 ))
+MIN_DISK_MIB=$(( STAGING_SIZE_MIB * 2 + 1024 ))
+MIN_DISK_BYTES=$(( MIN_DISK_MIB * 1024 * 1024 ))
 
-if (( DISK_BYTES <= MIN_NON_OVERLAP_DISK_BYTES )); then
-    die "target disk must be larger than ${MIN_NON_OVERLAP_DISK_MIB}MiB so the tail ${STAGING_SIZE_MIB}MiB staging loop cannot overlap the p3 write range"
+if (( DISK_BYTES <= MIN_DISK_BYTES )); then
+    die "target disk must be larger than ${MIN_DISK_MIB}MiB (2x ${STAGING_SIZE_MIB}MiB staging + 1GiB overhead for EFI/MINIOS-B)"
 fi
 
-if (( STAGING_OFFSET_BYTES % SECTOR_SIZE != 0 )); then
-    die "staging loop offset is not sector aligned"
-fi
+detect_minios_partition
 
 echo "Internal disk: $DISK"
 echo "Device name:   $device_name"
@@ -404,7 +441,9 @@ echo "Desktop pkg: ${DESKTOP_PACKAGE:-<none>}"
 echo "Disk size:   $DISK_BYTES bytes"
 echo "Sector size: $SECTOR_SIZE bytes"
 echo "Sectors:     $TOTAL_SECTORS"
-echo "Staging loop: offset=$STAGING_OFFSET_BYTES size=$STAGING_SIZE_BYTES"
+if [[ -n "$MINIOS_START" ]]; then
+    echo "MINIOS-B:    start=$MINIOS_START size=$MINIOS_SIZE type-uuid=$MINIOS_TYPE_UUID"
+fi
 
 echo
 echo "WARNING: ALL DATA WILL BE ERASED ON THIS DISK!"
@@ -467,7 +506,13 @@ P2_SIZE="$(align_up "$EFI_SIZE_SECTORS" "$ALIGN_SECTORS")"
 P2_END=$(( P2_START + P2_SIZE ))
 
 P3_START="$(align_up "$P2_END" "$ALIGN_SECTORS")"
-P3_END="$(align_down "$(( TOTAL_SECTORS - ALIGN_SECTORS ))" "$ALIGN_SECTORS")"
+
+if [[ -n "$MINIOS_START" ]]; then
+    P3_END="$(align_down "$MINIOS_START" "$ALIGN_SECTORS")"
+else
+    P3_END="$(align_down "$(( TOTAL_SECTORS - ALIGN_SECTORS ))" "$ALIGN_SECTORS")"
+fi
+
 P3_SIZE=$(( P3_END - P3_START ))
 
 if (( P3_SIZE <= 0 )); then
@@ -479,20 +524,30 @@ P2_SIZE_BYTES=$(( P2_SIZE * SECTOR_SIZE ))
 
 P3_OFFSET_BYTES=$(( P3_START * SECTOR_SIZE ))
 P3_SIZE_BYTES=$(( P3_SIZE * SECTOR_SIZE ))
+
+# Place staging loop at the end of p3 partition
+STAGING_OFFSET_BYTES=$(( P3_OFFSET_BYTES + P3_SIZE_BYTES - STAGING_SIZE_BYTES ))
 P3_WRITE_END_BYTES=$(( P3_OFFSET_BYTES + STAGING_SIZE_BYTES ))
 
 if (( STAGING_SIZE_BYTES > P3_SIZE_BYTES )); then
-    die "tail staging loop is larger than p3 rootfs partition"
+    die "staging loop is larger than p3 rootfs partition"
 fi
 
 if (( P3_WRITE_END_BYTES > STAGING_OFFSET_BYTES )); then
-    die "tail staging loop would overlap the p3 destination write range"
+    die "staging loop would overlap the p3 destination write range (p3 must be >= 2x staging size)"
+fi
+
+if (( STAGING_OFFSET_BYTES % SECTOR_SIZE != 0 )); then
+    die "staging loop offset is not sector aligned"
 fi
 
 echo "Partition plan:"
 echo "  p1 Submarine: start=$P1_START size=$P1_SIZE"
 echo "  p2 EFI:       start=$P2_START size=$P2_SIZE"
 echo "  p3 rootfs:    start=$P3_START size=$P3_SIZE"
+if [[ -n "$MINIOS_START" ]]; then
+    echo "  p4 MINIOS-B:  start=$MINIOS_START size=$MINIOS_SIZE"
+fi
 
 echo "Byte ranges:"
 echo "  p2 EFI:       offset=$P2_OFFSET_BYTES size=$P2_SIZE_BYTES"
@@ -505,6 +560,11 @@ cgpt add -i 2 -b "$P2_START" -s "$P2_SIZE" -t efi -l "EFI-SYSTEM" "$DISK"
 
 echo "Creating p3 rootfs partition in GPT..."
 cgpt add -i 3 -b "$P3_START" -s "$P3_SIZE" -t data -l "ROOTFS" "$DISK"
+
+if [[ -n "$MINIOS_START" ]]; then
+    echo "Recreating p4 MINIOS-B partition in GPT..."
+    cgpt add -i 4 -b "$MINIOS_START" -s "$MINIOS_SIZE" -t "$MINIOS_TYPE_UUID" -l "MINIOS-B" "$DISK"
+fi
 
 sync
 

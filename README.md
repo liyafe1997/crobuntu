@@ -17,11 +17,12 @@ All you need is:
     ````
 5. Follow the script prompt to continue (Basically select Ubuntu version and desktop environment)
 6. Wait it to be finished. After reboot, you will have Ubuntu!
-7. If you want to go back to ChromeOS, see [Recover your Chromebook](https://support.google.com/chromebook/answer/1080595)
+7. If you want to go back to ChromeOS, press [ESC+Refresh+Power] to recover. Read [Recover your Chromebook](https://support.google.com/chromebook/answer/1080595) to learn more.
 
 Note:
 1. Default username: `ubuntu`, password: `ubuntu`.
 2. Web browser might not be installed because snap pacakegs could not be installed automatically during the `chroot` setup process. You can just simply do `snap install firefox` to get Firefox installed.
+3. This script will preseve the ChromeOS Cloud Recovery partition for you (aka MINIOS-B, a small parition at the end of the disk). If your device supports cloud recovery, you should be able to go back to ChromeOS just by press [ESC+Refresh+Power] and select [Recover using internet], without making a USB drive. If you think you don't need that you can also delete it and expand the ext4 rootfs in Ubuntu. Once you delete that partition, you have to use a USB drive to recover ChromeOS.
 
 ## No Sound on Ubuntu?
 Check https://github.com/WeirdTreeThing/chromebook-linux-audio
